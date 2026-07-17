@@ -1,0 +1,14 @@
+when:
+  - event: [push, pull_request, tag]
+
+steps:
+  test:
+    image: node:22
+    commands:
+      - npm ci
+      - node --check index.js
+      - node --check auth.js
+      - node --check security.js
+      - node --check tools-extra.js
+      - node --check scripts/token.js
+      - node test/smoke.mjs

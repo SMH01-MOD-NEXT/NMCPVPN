@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+/dist
+/build
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Secrets & Local Data
+tokens.json
+memory.json
+test/tokens.smoke.json
+.env
+.env.local
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
