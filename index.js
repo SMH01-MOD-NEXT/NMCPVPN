@@ -286,68 +286,60 @@ app.use(requireAuth);
 app.get("/sse", async (req, res) => {
     log("New SSE connection request");
 
-    // 1. Настройка сокета против таймаутов
+    // 1. Настройки сокета
     req.socket.setTimeout(0);
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true);
 
-    // 2. Устанавливаем заголовки (SDK сама вызовет res.writeHead(200), используя эти заголовки)
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
+    // 2. Дополнительные заголовки (SDK сама добавит Content-Type и Cache-Control)
     res.setHeader("X-Accel-Buffering", "no");
+    res.setHeader("Connection", "keep-alive");
 
-    // 3. Перехватываем первый res.write от SDK, чтобы пробить буфер Cloudflare
-    const originalWrite = res.write.bind(res);
-    let isFirstChunk = true;
+    // 3. Перехватываем writeHead: даем SDK выставить 200 OK, и СРАЗУ плюем 4KB в сокет
+    const originalWriteHead = res.writeHead.bind(res);
     let intervalId = null;
 
-    res.write = function (chunk, encoding, callback) {
-        if (isFirstChunk) {
-            isFirstChunk = false;
-            // Добавляем 4KB комментариев ПЕРЕД первым вызовом (event: endpoint)
-            const padding = `: ${' '.repeat(4096)}\n\n`;
+    res.writeHead = function (statusCode, headers) {
+        // Вызываем оригинальный writeHead от Express/Node
+        const result = originalWriteHead(statusCode, headers);
 
-            if (typeof chunk === "string") {
-                chunk = padding + chunk;
-            } else if (Buffer.isBuffer(chunk)) {
-                chunk = Buffer.concat([Buffer.from(padding), chunk]);
+        // В тот же миг выплевываем 4KB пробелов/комментариев для Cloudflare
+        res.write(`: ${' '.repeat(4096)}\n\n`);
+
+        // Запускаем heartbeat каждые 15 сек против таймаутов CF (524 Error)
+        intervalId = setInterval(() => {
+            try {
+                res.write(": keepalive\n\n");
+            } catch (e) {
+                clearInterval(intervalId);
             }
+        }, 15000);
 
-            // Запускаем периодический keepalive каждые 15 сек, чтобы cloudflared не закрывал стрим
-            intervalId = setInterval(() => {
-                try {
-                    originalWrite(": keepalive\n\n");
-                } catch (e) {
-                    clearInterval(intervalId);
-                }
-            }, 15000);
-        }
-
-        return originalWrite(chunk, encoding, callback);
+        return result;
     };
 
-    // 4. Инициализация MCP
-    const transport = new SSEServerTransport("/messages", res);
-    const serverInstance = createServerInstance();
-
-    transports.set(transport.sessionId, transport);
-
+    // 4. Очистка при закрытии
     const cleanup = () => {
         if (intervalId) clearInterval(intervalId);
-        transports.delete(transport.sessionId);
+        if (transport) transports.delete(transport.sessionId);
     };
 
-    transport.onclose = () => {
-        log("SSE connection closed for session:", transport.sessionId);
-        cleanup();
-    };
+        req.on("close", cleanup);
 
-    req.on("close", cleanup);
+        // 5. Инициализируем SDK
+        const transport = new SSEServerTransport("/messages", res);
+        const serverInstance = createServerInstance();
 
-    // 5. Запуск (SDK сам отправит 200 OK и сработает перехваченный res.write)
-    await serverInstance.connect(transport);
-    log("Server instance connected to SSE session:", transport.sessionId);
+        transports.set(transport.sessionId, transport);
+
+        transport.onclose = () => {
+            log("SSE connection closed for session:", transport.sessionId);
+            cleanup();
+        };
+
+        // В этот момент SDK вызовет res.writeHead(), наш патч сработает и пробьет CF
+        await serverInstance.connect(transport);
+        log("Server instance connected to SSE session:", transport.sessionId);
 });
 
 app.post("/messages", async (req, res) => {
