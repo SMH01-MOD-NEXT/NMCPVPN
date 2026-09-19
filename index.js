@@ -12,6 +12,7 @@ import path from "path";
 import { assertAllowed } from "./security.js";
 import { authEnabled, requireAuth, TOKENS_FILE } from "./auth.js";
 import { registerExtraTools } from "./tools-extra.js";
+import { registerImageTools } from "./tools-image.js";
 
 // -----------------------------
 // Logging helper
@@ -259,6 +260,11 @@ defineTool("gitCommit", "Commit changes", {
 // Extra tools (editFile, background processes, git extras)
 // -----------------------------
 registerExtraTools(defineTool, log);
+
+// -----------------------------
+// Image tools (readImage, compareImages)
+// -----------------------------
+registerImageTools(defineTool, log);
 
 // Функция для создания и настройки нового экземпляра сервера
 function createServerInstance() {

@@ -34,6 +34,13 @@ All git tools accept a repository directory (`path`/`cwd`) and default to the se
 | `gitBranch` | List, create or switch branches |
 | `gitShow` | Show a commit (message + diff, or `--stat` summary) |
 
+### Images
+Pixel work is done with Pillow through `python3` (override the interpreter with `MCP_PYTHON`). Both tools return MCP `image` content, so a model can actually look at the result, plus a JSON line with the measurements.
+| Tool | Description |
+|---|---|
+| `readImage` | View an image file: optional `crop` (`x`,`y`,`w`,`h`), `maxWidth`/`maxHeight` downscaling, `grid` overlay every N px, `format` (`png`/`jpeg`), `frame` for animations. Transparency is composited onto a checkerboard unless `flattenAlpha=false`. Oversized images are re-encoded and shrunk to fit `maxBytes` (1.2 MB default) |
+| `compareImages` | Compare two images: mean (`mae`) and RMS difference, `changedPercent` above `threshold`, an N x N `regions` map, `changedBoundingBox`, and an amplified diff image returned inline and optionally written to `diffPath`. `b` is resized to `a` unless `resize=false` |
+
 ### Web & memory
 | Tool | Description |
 |---|---|
@@ -98,7 +105,8 @@ When unset, file tools can access everything the server user can (a warning is l
 ## Tests
 
 ```bash
-node test/smoke.mjs   # token manager + live auth checks
+node test/smoke.mjs              # token manager + live auth checks
+node test/image-tools.test.mjs   # readImage + compareImages (needs Pillow)
 ```
 
 CI runs syntax checks and the smoke test on every push/tag (`.woodpecker.yml`, Codeberg Woodpecker).
