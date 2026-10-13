@@ -327,6 +327,15 @@ const skipApprovalsArg = process.argv.includes("--skip-approvals");
 const skipApprovalsEnv = String(process.env.MCP_SKIP_APPROVALS || "").toLowerCase();
 const skipApprovals = skipApprovalsArg || ["1", "true", "yes"].includes(skipApprovalsEnv);
 
+const bypassLevelArg = (() => {
+    const i = process.argv.findIndex((a) => a === "--bypass-level" || a === "--bypass-levels" || a.startsWith("--bypass-level=") || a.startsWith("--bypass-levels="));
+    if (i < 0) return undefined;
+    const val = process.argv[i].includes("=") ? process.argv[i].split("=")[1] : process.argv[i + 1];
+    return Number(val);
+})();
+const bypassLevelEnv = Number(process.env.MCP_BYPASS_LEVEL || process.env.BYPASS_LEVEL || process.env.MCP_BYPASS_LEVELS || process.env.BYPASS_LEVELS || (skipApprovals ? 1 : 0));
+const bypassLevel = skipApprovals ? (Number.isFinite(bypassLevelArg) ? bypassLevelArg : Number.isFinite(bypassLevelEnv) ? bypassLevelEnv : 1) : 0;
+
 // Функция для создания и настройки нового экземпляра сервера
 function createServerInstance() {
     const server = new McpServer({
@@ -337,10 +346,21 @@ function createServerInstance() {
     for (const t of registeredTools) {
         let annotations = TOOL_ANNOTATIONS[t.name];
         if (skipApprovals) {
-            annotations = {
-                ...(annotations || {}),
-                readOnlyHint: true
-            };
+            if (bypassLevel >= 3) {
+                annotations = { ...READ, ...(annotations?.title ? { title: annotations.title } : {}) };
+            } else if (bypassLevel >= 2) {
+                annotations = {
+                    ...(annotations || {}),
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true
+                };
+            } else {
+                annotations = {
+                    ...(annotations || {}),
+                    readOnlyHint: true
+                };
+            }
         }
         if (annotations) server.tool(t.name, t.description, t.schema, annotations, t.handler);
         else server.tool(t.name, t.description, t.schema, t.handler);
@@ -527,6 +547,6 @@ if (MODE === "stdio") {
         if (SSE_ENABLED) log(`- SSE endpoint: http://localhost:${PORT}/sse`);
         log(`- OAuth: ${oauth ? `enabled, issuer ${oauth.baseUrl.href} (state: ${OAUTH_FILE})${process.env.MCP_OAUTH_PASSWORD ? "" : " - MCP_OAUTH_PASSWORD not set, consent needs a token from tokens.json"}` : "disabled (set MCP_PUBLIC_URL to enable)"}`);
         log(`- Auth: ${(oauth || authEnabled()) ? `enabled (tokens: ${TOKENS_FILE})` : "disabled (no active tokens; create one with scripts/token.js)"}`);
-        log(`- Skip approvals: ${skipApprovals ? "enabled (all tools have readOnlyHint: true)" : "disabled"}`);
+        log(`- Skip approvals: ${skipApprovals ? `enabled (bypass level: ${bypassLevel})` : "disabled"}`);
     });
 }
