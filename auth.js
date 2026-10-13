@@ -60,3 +60,35 @@ export function requireAuth(req, res, next) {
     if (isValidToken(token)) return next();
     res.status(401).json({ error: "Unauthorized: valid token required" });
 }
+
+// Combined middleware: accepts static tokens from tokens.json and, when OAuth
+// is configured, OAuth access tokens issued by oauth.js. With OAuth enabled
+// auth is always enforced, and 401 responses carry a WWW-Authenticate header
+// pointing at the protected-resource metadata so MCP clients can discover
+// the authorization server (RFC 9728).
+export function createAuthMiddleware({ oauth, publicPaths = [] } = {}) {
+    return async function auth(req, res, next) {
+        if (publicPaths.some((p) => req.path === p || req.path.startsWith(p + "/"))) return next();
+        if (!oauth && !authEnabled()) return next();
+        if (oauth && forcedOff) return next();
+
+        const header = req.headers.authorization || "";
+        const bearer = /^Bearer\s+/i.test(header) ? header.replace(/^Bearer\s+/i, "").trim() : null;
+        const token = bearer || req.query.token;
+
+        if (isValidToken(token)) return next();
+        if (oauth && token) {
+            try {
+                req.auth = await oauth.provider.verifyAccessToken(token);
+                return next();
+            } catch {
+                // fall through to 401
+            }
+        }
+        if (oauth) {
+            const err = token ? ', error="invalid_token"' : "";
+            res.set("WWW-Authenticate", `Bearer realm="mcp"${err}, resource_metadata="${oauth.resourceMetadataUrl}"`);
+        }
+        res.status(401).json({ error: token ? "invalid_token" : "Unauthorized: valid token required" });
+    };
+}

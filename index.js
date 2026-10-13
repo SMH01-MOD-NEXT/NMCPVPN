@@ -1,5 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "crypto";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import express from "express";
 import { z } from "zod";
@@ -10,7 +13,8 @@ import axios from "axios";
 import TurndownService from "turndown";
 import path from "path";
 import { assertAllowed } from "./security.js";
-import { authEnabled, requireAuth, TOKENS_FILE } from "./auth.js";
+import { authEnabled, createAuthMiddleware, TOKENS_FILE } from "./auth.js";
+import { oauthEnabled, setupOAuth, OAUTH_PUBLIC_PATHS, OAUTH_FILE } from "./oauth.js";
 import { registerExtraTools } from "./tools-extra.js";
 import { registerImageTools } from "./tools-image.js";
 
@@ -26,6 +30,42 @@ const log = (...args) => {
 // -----------------------------
 // Мы сохраняем определения инструментов отдельно, чтобы создавать новые экземпляры сервера для каждого подключения
 const registeredTools = [];
+
+// MCP tool annotations. Clients (Notion, Claude, ChatGPT) use readOnlyHint to
+// split tools into read / write and to decide which calls need approval.
+// Tools missing here get no hints, which clients treat as "write".
+const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
+const TOOL_ANNOTATIONS = {
+    // filesystem
+    readFile: { ...READ, title: "Read file" },
+    listDirectory: { ...READ, title: "List directory" },
+    searchFiles: { ...READ, title: "Search files" },
+    findFiles: { ...READ, title: "Find files" },
+    writeFile: { ...DESTRUCTIVE, idempotentHint: true, title: "Write file" },
+    editFile: { ...DESTRUCTIVE, title: "Edit file" },
+    // shell & processes
+    executeShell: { ...DESTRUCTIVE, openWorldHint: true, title: "Execute shell command" },
+    startProcess: { ...DESTRUCTIVE, openWorldHint: true, title: "Start background process" },
+    stopProcess: { ...DESTRUCTIVE, title: "Stop background process" },
+    processStatus: { ...READ, idempotentHint: false, title: "Process status" },
+    readProcessOutput: { ...READ, idempotentHint: false, title: "Read process output" },
+    // git
+    gitStatus: { ...READ, title: "Git status" },
+    gitDiff: { ...READ, title: "Git diff" },
+    gitLog: { ...READ, title: "Git log" },
+    gitShow: { ...READ, title: "Git show" },
+    gitCommit: { ...WRITE, title: "Git commit" },
+    gitBranch: { ...WRITE, title: "Git branch (list / create / switch)" },
+    // images (compareImages only writes when diffPath is given)
+    readImage: { ...READ, title: "Read image" },
+    compareImages: { ...READ, title: "Compare images" },
+    // web & memory
+    fetchUrl: { ...READ, idempotentHint: false, openWorldHint: true, title: "Fetch URL" },
+    getValue: { ...READ, title: "Get stored value" },
+    storeValue: { ...WRITE, idempotentHint: true, title: "Store value" },
+};
 
 const defineTool = (name, description, schema, handler) => {
     registeredTools.push({ name, description, schema, handler });
@@ -274,7 +314,9 @@ function createServerInstance() {
     });
     // Регистрируем все инструменты в новом экземпляре
     for (const t of registeredTools) {
-        server.tool(t.name, t.description, t.schema, t.handler);
+        const annotations = TOOL_ANNOTATIONS[t.name];
+        if (annotations) server.tool(t.name, t.description, t.schema, annotations, t.handler);
+        else server.tool(t.name, t.description, t.schema, t.handler);
     }
     return server;
 }
@@ -283,92 +325,200 @@ function createServerInstance() {
 // Server Start Logic
 // -----------------------------
 
+// Transport selection: MCP_TRANSPORT=both (default) | http | sse | stdio,
+// or `node index.js --transport http`. USE_STDIO=true still means stdio.
+const transportArg = (() => {
+    const i = process.argv.findIndex((a) => a === "--transport" || a.startsWith("--transport="));
+    if (i < 0) return undefined;
+    return process.argv[i].includes("=") ? process.argv[i].split("=")[1] : process.argv[i + 1];
+})();
+const TRANSPORT = String(transportArg || process.env.MCP_TRANSPORT || (process.env.USE_STDIO === "true" ? "stdio" : "both")).toLowerCase();
+const TRANSPORT_ALIASES = { both: "both", all: "both", http: "http", streamable: "http", "streamable-http": "http", sse: "sse", stdio: "stdio" };
+if (!TRANSPORT_ALIASES[TRANSPORT]) {
+    console.error(`Unknown transport "${TRANSPORT}". Use one of: both, http, sse, stdio`);
+    process.exit(1);
+}
+const MODE = TRANSPORT_ALIASES[TRANSPORT];
+const SSE_ENABLED = MODE === "both" || MODE === "sse";
+const HTTP_ENABLED = MODE === "both" || MODE === "http";
+
 const app = express();
 const transports = new Map();
 
-// Bearer-token auth (opt-in): set MCP_REQUIRE_AUTH=1 and create tokens with scripts/token.js
-app.use(requireAuth);
+// Behind cloudflared / nginx: trust X-Forwarded-* from the proxy (rate limiting, https detection)
+const trustProxy = process.env.MCP_TRUST_PROXY ?? "loopback";
+app.set("trust proxy", /^\d+$/.test(trustProxy) ? Number(trustProxy)
+    : trustProxy === "true" ? true : trustProxy === "false" ? false : trustProxy);
 
-app.get("/sse", async (req, res) => {
-    log("New SSE connection request");
+// OAuth 2.1 (DCR + Authorization Code/PKCE), enabled by MCP_PUBLIC_URL or MCP_OAUTH=1 (see oauth.js)
+const oauth = oauthEnabled() ? setupOAuth(app, process.env.PORT || 8000) : null;
 
-    // 1. Настройки сокета
-    req.socket.setTimeout(0);
-    req.socket.setNoDelay(true);
-    req.socket.setKeepAlive(true);
+// Bearer auth: static tokens from tokens.json (scripts/token.js) and OAuth access tokens
+app.use(createAuthMiddleware({ oauth, publicPaths: OAUTH_PUBLIC_PATHS }));
 
-    // 2. Дополнительные заголовки (SDK сама добавит Content-Type и Cache-Control)
-    res.setHeader("X-Accel-Buffering", "no");
-    res.setHeader("Connection", "keep-alive");
+// -----------------------------
+// Legacy SSE transport: GET /sse + POST /messages
+// -----------------------------
+if (SSE_ENABLED) {
+    app.get("/sse", async (req, res) => {
+        log("New SSE connection request");
 
-    // 3. Перехватываем writeHead: даем SDK выставить 200 OK, и СРАЗУ плюем 4KB в сокет
-    const originalWriteHead = res.writeHead.bind(res);
-    let intervalId = null;
+        // 1. Настройки сокета
+        req.socket.setTimeout(0);
+        req.socket.setNoDelay(true);
+        req.socket.setKeepAlive(true);
 
-    res.writeHead = function (statusCode, headers) {
-        // Вызываем оригинальный writeHead от Express/Node
-        const result = originalWriteHead(statusCode, headers);
+        // 2. Дополнительные заголовки (SDK сама добавит Content-Type и Cache-Control)
+        res.setHeader("X-Accel-Buffering", "no");
+        res.setHeader("Connection", "keep-alive");
 
-        // В тот же миг выплевываем 4KB пробелов/комментариев для Cloudflare
-        res.write(`: ${' '.repeat(4096)}\n\n`);
+        // 3. Перехватываем writeHead: даем SDK выставить 200 OK, и СРАЗУ плюем 4KB в сокет
+        const originalWriteHead = res.writeHead.bind(res);
+        let intervalId = null;
 
-        // Запускаем heartbeat каждые 15 сек против таймаутов CF (524 Error)
-        intervalId = setInterval(() => {
-            try {
-                res.write(": keepalive\n\n");
-            } catch (e) {
-                clearInterval(intervalId);
-            }
-        }, 15000);
+        res.writeHead = function (statusCode, headers) {
+            // Вызываем оригинальный writeHead от Express/Node
+            const result = originalWriteHead(statusCode, headers);
 
-        return result;
-    };
+            // В тот же миг выплевываем 4KB пробелов/комментариев для Cloudflare
+            res.write(`: ${' '.repeat(4096)}\n\n`);
 
-    // 4. Очистка при закрытии
-    const cleanup = () => {
-        if (intervalId) clearInterval(intervalId);
-        if (transport) transports.delete(transport.sessionId);
-    };
+            // Запускаем heartbeat каждые 15 сек против таймаутов CF (524 Error)
+            intervalId = setInterval(() => {
+                try {
+                    res.write(": keepalive\n\n");
+                } catch (e) {
+                    clearInterval(intervalId);
+                }
+            }, 15000);
 
-        req.on("close", cleanup);
-
-        // 5. Инициализируем SDK
-        const transport = new SSEServerTransport("/messages", res);
-        const serverInstance = createServerInstance();
-
-        transports.set(transport.sessionId, transport);
-
-        transport.onclose = () => {
-            log("SSE connection closed for session:", transport.sessionId);
-            cleanup();
+            return result;
         };
 
-        // В этот момент SDK вызовет res.writeHead(), наш патч сработает и пробьет CF
-        await serverInstance.connect(transport);
-        log("Server instance connected to SSE session:", transport.sessionId);
-});
+        // 4. Очистка при закрытии
+        const cleanup = () => {
+            if (intervalId) clearInterval(intervalId);
+            if (transport) transports.delete(transport.sessionId);
+        };
 
-app.post("/messages", async (req, res) => {
-    const sessionId = req.query.sessionId;
-    const transport = transports.get(sessionId);
-    if (transport) {
-        await transport.handlePostMessage(req, res);
-    } else {
-        res.status(404).send("Session not found");
-    }
-});
+            req.on("close", cleanup);
+
+            // 5. Инициализируем SDK
+            const transport = new SSEServerTransport("/messages", res);
+            const serverInstance = createServerInstance();
+
+            transports.set(transport.sessionId, transport);
+
+            transport.onclose = () => {
+                log("SSE connection closed for session:", transport.sessionId);
+                cleanup();
+            };
+
+            // В этот момент SDK вызовет res.writeHead(), наш патч сработает и пробьет CF
+            await serverInstance.connect(transport);
+            log("Server instance connected to SSE session:", transport.sessionId);
+    });
+
+    app.post("/messages", async (req, res) => {
+        const sessionId = req.query.sessionId;
+        const transport = transports.get(sessionId);
+        if (transport) {
+            await transport.handlePostMessage(req, res);
+        } else {
+            res.status(404).send("Session not found");
+        }
+    });
+}
+
+// -----------------------------
+// Streamable HTTP transport (MCP spec 2025-03-26+): POST/GET/DELETE /mcp
+// -----------------------------
+if (HTTP_ENABLED) {
+    const httpSessions = new Map(); // sessionId -> { transport, server, lastSeen }
+    const SESSION_IDLE_MS = Number(process.env.MCP_HTTP_SESSION_IDLE_MS || 30 * 60 * 1000);
+    const rpcError = (res, status, code, message) =>
+        res.status(status).json({ jsonrpc: "2.0", error: { code, message }, id: null });
+    const isInit = (body) => (Array.isArray(body) ? body.some((m) => isInitializeRequest(m)) : isInitializeRequest(body));
+
+    app.post("/mcp", express.json({ limit: "50mb" }), async (req, res) => {
+        try {
+            const sid = req.headers["mcp-session-id"];
+            let entry = sid ? httpSessions.get(sid) : undefined;
+            if (!entry) {
+                // Unknown session -> 404 so the client re-initializes (per spec)
+                if (sid) return rpcError(res, 404, -32001, "Session not found");
+                if (!isInit(req.body)) return rpcError(res, 400, -32000, "Bad Request: send initialize first (no mcp-session-id)");
+
+                const server = createServerInstance();
+                const transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: () => randomUUID(),
+                    onsessioninitialized: (id) => {
+                        httpSessions.set(id, entry);
+                        log("Streamable HTTP session started:", id);
+                    },
+                });
+                entry = { transport, server, lastSeen: Date.now() };
+                transport.onclose = () => {
+                    if (transport.sessionId && httpSessions.delete(transport.sessionId)) {
+                        log("Streamable HTTP session closed:", transport.sessionId);
+                    }
+                };
+                await server.connect(transport);
+            }
+            entry.lastSeen = Date.now();
+            await entry.transport.handleRequest(req, res, req.body);
+        } catch (e) {
+            log("Streamable HTTP error:", e?.message || e);
+            if (!res.headersSent) rpcError(res, 500, -32603, "Internal server error");
+        }
+    });
+
+    // GET opens the server->client SSE stream, DELETE ends the session
+    const sessionRequest = async (req, res) => {
+        const sid = req.headers["mcp-session-id"];
+        const entry = sid && httpSessions.get(sid);
+        if (!entry) return sid ? rpcError(res, 404, -32001, "Session not found") : rpcError(res, 400, -32000, "Missing mcp-session-id");
+        entry.lastSeen = Date.now();
+        if (req.method === "GET") {
+            req.socket.setTimeout(0);
+            req.socket.setKeepAlive(true);
+            res.setHeader("X-Accel-Buffering", "no");
+        }
+        try {
+            await entry.transport.handleRequest(req, res);
+        } catch (e) {
+            log("Streamable HTTP error:", e?.message || e);
+            if (!res.headersSent) rpcError(res, 500, -32603, "Internal server error");
+        }
+    };
+    app.get("/mcp", sessionRequest);
+    app.delete("/mcp", sessionRequest);
+
+    // Drop sessions whose client vanished without DELETE
+    setInterval(() => {
+        const cutoff = Date.now() - SESSION_IDLE_MS;
+        for (const [id, e] of httpSessions) {
+            if (e.lastSeen < cutoff) {
+                httpSessions.delete(id);
+                e.transport.close().catch(() => {});
+            }
+        }
+    }, 60_000).unref();
+}
 
 const PORT = process.env.PORT || 8000;
 
-if (process.env.USE_STDIO === "true") {
+if (MODE === "stdio") {
     log("Starting MCP server in STDIO mode");
     const transport = new StdioServerTransport();
     const serverInstance = createServerInstance();
     await serverInstance.connect(transport);
 } else {
     app.listen(PORT, () => {
-        log(`MCP Server listening for SSE on port ${PORT}`);
-        log(`- SSE endpoint: http://localhost:${PORT}/sse`);
-        log(`- Auth: ${authEnabled() ? `enabled (tokens: ${TOKENS_FILE})` : "disabled (no active tokens; create one with scripts/token.js)"}`);
+        log(`MCP Server listening on port ${PORT} (transport: ${MODE})`);
+        if (HTTP_ENABLED) log(`- Streamable HTTP endpoint: http://localhost:${PORT}/mcp`);
+        if (SSE_ENABLED) log(`- SSE endpoint: http://localhost:${PORT}/sse`);
+        log(`- OAuth: ${oauth ? `enabled, issuer ${oauth.baseUrl.href} (state: ${OAUTH_FILE})${process.env.MCP_OAUTH_PASSWORD ? "" : " - MCP_OAUTH_PASSWORD not set, consent needs a token from tokens.json"}` : "disabled (set MCP_PUBLIC_URL to enable)"}`);
+        log(`- Auth: ${(oauth || authEnabled()) ? `enabled (tokens: ${TOKENS_FILE})` : "disabled (no active tokens; create one with scripts/token.js)"}`);
     });
 }

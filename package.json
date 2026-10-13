@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node test/smoke.mjs && node test/image-tools.test.mjs"
+    "start:http": "node index.js --transport http",
+    "start:sse": "node index.js --transport sse",
+    "start:stdio": "node index.js --transport stdio",
+    "test": "node test/smoke.mjs && node test/oauth.test.mjs && node test/transport.test.mjs && node test/image-tools.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",

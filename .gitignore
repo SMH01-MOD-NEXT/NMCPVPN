@@ -13,6 +13,9 @@ yarn-error.log*
 tokens.json
 memory.json
 test/tokens.smoke.json
+oauth.json
+test/oauth.test.json
+test/tokens.oauth-test.json
 .env
 .env.local
 
