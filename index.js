@@ -306,25 +306,6 @@ registerExtraTools(defineTool, log);
 // -----------------------------
 registerImageTools(defineTool, log);
 
-// Функция для создания и настройки нового экземпляра сервера
-function createServerInstance() {
-    const server = new McpServer({
-        name: "combined-mcp-server",
-        version: "1.0.0"
-    });
-    // Регистрируем все инструменты в новом экземпляре
-    for (const t of registeredTools) {
-        const annotations = TOOL_ANNOTATIONS[t.name];
-        if (annotations) server.tool(t.name, t.description, t.schema, annotations, t.handler);
-        else server.tool(t.name, t.description, t.schema, t.handler);
-    }
-    return server;
-}
-
-// -----------------------------
-// Server Start Logic
-// -----------------------------
-
 // Transport selection: MCP_TRANSPORT=both (default) | http | sse | stdio,
 // or `node index.js --transport http`. USE_STDIO=true still means stdio.
 const transportArg = (() => {
@@ -341,6 +322,31 @@ if (!TRANSPORT_ALIASES[TRANSPORT]) {
 const MODE = TRANSPORT_ALIASES[TRANSPORT];
 const SSE_ENABLED = MODE === "both" || MODE === "sse";
 const HTTP_ENABLED = MODE === "both" || MODE === "http";
+
+const skipApprovalsArg = process.argv.includes("--skip-approvals");
+const skipApprovalsEnv = String(process.env.MCP_SKIP_APPROVALS || "").toLowerCase();
+const skipApprovals = skipApprovalsArg || ["1", "true", "yes"].includes(skipApprovalsEnv);
+
+// Функция для создания и настройки нового экземпляра сервера
+function createServerInstance() {
+    const server = new McpServer({
+        name: "combined-mcp-server",
+        version: "1.0.0"
+    });
+    // Регистрируем все инструменты в новом экземпляре
+    for (const t of registeredTools) {
+        let annotations = TOOL_ANNOTATIONS[t.name];
+        if (skipApprovals) {
+            annotations = {
+                ...(annotations || {}),
+                readOnlyHint: true
+            };
+        }
+        if (annotations) server.tool(t.name, t.description, t.schema, annotations, t.handler);
+        else server.tool(t.name, t.description, t.schema, t.handler);
+    }
+    return server;
+}
 
 const app = express();
 const transports = new Map();
@@ -510,6 +516,7 @@ const PORT = process.env.PORT || 8000;
 
 if (MODE === "stdio") {
     log("Starting MCP server in STDIO mode");
+    if (skipApprovals) log("Skip approvals enabled (all tools have readOnlyHint: true)");
     const transport = new StdioServerTransport();
     const serverInstance = createServerInstance();
     await serverInstance.connect(transport);
@@ -520,5 +527,6 @@ if (MODE === "stdio") {
         if (SSE_ENABLED) log(`- SSE endpoint: http://localhost:${PORT}/sse`);
         log(`- OAuth: ${oauth ? `enabled, issuer ${oauth.baseUrl.href} (state: ${OAUTH_FILE})${process.env.MCP_OAUTH_PASSWORD ? "" : " - MCP_OAUTH_PASSWORD not set, consent needs a token from tokens.json"}` : "disabled (set MCP_PUBLIC_URL to enable)"}`);
         log(`- Auth: ${(oauth || authEnabled()) ? `enabled (tokens: ${TOKENS_FILE})` : "disabled (no active tokens; create one with scripts/token.js)"}`);
+        log(`- Skip approvals: ${skipApprovals ? "enabled (all tools have readOnlyHint: true)" : "disabled"}`);
     });
 }

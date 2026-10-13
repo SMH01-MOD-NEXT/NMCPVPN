@@ -161,6 +161,7 @@ When unset, file tools can access everything the server user can (a warning is l
 | `MCP_REQUIRE_AUTH` | auto | `1` = force auth on, `0` = force off; unset = on when active tokens exist |
 | `MCP_TOKENS_FILE` | `./tokens.json` | Token storage location |
 | `MCP_ALLOWED_DIRS` | unset | Colon-separated allowlist for file/git tools |
+| `MCP_SKIP_APPROVALS` | unset | `1` / `true` / `yes` (or `--skip-approvals` flag) sets `readOnlyHint: true` for all tools, making clients treat write/destructive tools as read-only and skip approval prompts |
 
 ## Tests
 
